@@ -11,12 +11,32 @@ from yolov3_tf2.models import (
 from yolov3_tf2.dataset import transform_images
 from yolov3_tf2.utils import draw_outputs, convert_boxes
 
+class TrackState:
+    """
+    Enumeration type for the single target track state. Newly created tracks are
+    classified as `tentative` until enough evidence has been collected. Then,
+    the track state is changed to `confirmed`. Tracks that are no longer alive
+    are classified as `deleted` to mark them for removal from the set of active
+    tracks.
+    """
+
+    Tentative = 1
+    Confirmed = 2
+    Deleted = 3
+
 from deep_sort import preprocessing
 from deep_sort import nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
 from tools import generate_detections as gdet
 from PIL import Image
+
+
+from utils.detection_rule import DetectionRule
+from draw_utils.cropping import cropping_coors
+from configs.config_utils.conf import Conf
+
+import json
 
 flags.DEFINE_string('classes', './data/labels/coco.names', 'path to classes file')
 flags.DEFINE_string('weights', './weights/yolov3.tf',
@@ -28,20 +48,77 @@ flags.DEFINE_string('video', './data/video/test.mp4',
 flags.DEFINE_string('output', None, 'path to output video')
 flags.DEFINE_string('output_format', 'XVID', 'codec used in VideoWriter when saving video to file')
 flags.DEFINE_integer('num_classes', 80, 'number of classes in the model')
+flags.DEFINE_boolean('old_config', False, 'old config')
 
+def init_detection_rule():
+    try:
+        vid = cv2.VideoCapture(int(FLAGS.video))
+    except:
+        vid = cv2.VideoCapture(FLAGS.video)
+    
+    _, frame = vid.read()
+    x,y,w,h = cropping_coors(frame)
+    vid.release()
+    return DetectionRule((x,y),(x+w,y+h))
+
+
+def display_counting(origin_frame,count_line,detection_rule):
+    # create a blank space next to frame to display No. cars
+    blank_region = np.ones((origin_frame.shape[0],250,3), np.uint8)*255
+    cv2.putText(blank_region, "No. car(s):", (40,origin_frame.shape[0]//2-120),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
+    
+    # counting line
+    cv2.line(origin_frame,count_line[0],count_line[1],(0,255,0),3)
+    
+    # detection bounding area
+    
+    tl = detection_rule.tl
+    br = detection_rule.br
+        # (0,0,255) :red
+    cv2.rectangle(origin_frame, tl, br, (0,0,255), 2)
+    
+	  # stack the frame with blank space
+    cv2.putText(blank_region, str(car_count), (40,origin_frame.shape[0]//2),
+    cv2.FONT_HERSHEY_SIMPLEX, 4, (0, 0, 0), 3)
+        
+    stack_image = np.concatenate((origin_frame,blank_region),axis=1)
+
+    return stack_image
+
+car_count = 0
+detections = []
+
+# loading bunches of config:
+COSINE_CONFIG = Conf("/home/mmlab/git_workspace/yolov3_deepsort/configs/metric_config/cosine_distance.config")
+DEEPSORT_CONFIG = Conf("/home/mmlab/git_workspace/yolov3_deepsort/configs/model_config/deep_sort.config")
+OLD_CONFIG = Conf("/home/mmlab/git_workspace/yolov3_deepsort/rules/detection_rule.json")
 
 def main(_argv):
+
+    global car_count
     # Definition of the parameters
-    max_cosine_distance = 0.5
-    nn_budget = None
+    max_cosine_distance = COSINE_CONFIG["max_cosine_distance"]
+    nn_budget = COSINE_CONFIG["nn_budget"]
     nms_max_overlap = 1.0
     
     #initialize deep sort
-    model_filename = 'model_data/mars-small128.pb'
+    model_filename = DEEPSORT_CONFIG["model_path"]
     encoder = gdet.create_box_encoder(model_filename, batch_size=1)
     metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
     tracker = Tracker(metric)
-
+    
+    #initialize detection rule
+    if FLAGS.old_config == True:
+      cv2.imshow("image",OLD_CONFIG["img_path"])
+      xmin = OLD_CONFIG["xmin"]
+      ymin = OLD_CONFIG["ymin"]
+      xmax = OLD_CONFIG["xmax"]
+      ymax = OLD_CONFIG["ymax"]
+      detection_rule = DetectionRule((xmin,ymin),(xmax,ymax))
+    else:
+      detection_rule = init_detection_rule()
+    
     physical_devices = tf.config.experimental.list_physical_devices('GPU')
     if len(physical_devices) > 0:
         tf.config.experimental.set_memory_growth(physical_devices[0], True)
@@ -69,16 +146,24 @@ def main(_argv):
         width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(vid.get(cv2.CAP_PROP_FPS))
-        codec = cv2.VideoWriter_fourcc(*FLAGS.output_format)
-        out = cv2.VideoWriter(FLAGS.output, codec, fps, (width, height))
+        codec = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(FLAGS.output, codec, fps, (width + 250, height))
+        #frame.shape[1]+250,frame.shape[0]
         list_file = open('detection.txt', 'w')
         frame_index = -1 
-    
+    count_line = [(0,int(height/2)),(int(width),int(height/2))]
     fps = 0.0
     count = 0 
+    frame_index = -1
+    track_ids = []
     while True:
         _, img = vid.read()
-
+        if frame_index == 0:
+          print(count_line)
+        frame_index = frame_index + 1
+        print("Frame index:",frame_index,",car count:",car_count
+        ,"len trackers",len(tracker.tracks))
+        t1 = time.time()
         if img is None:
             logging.warning("Empty Frame")
             time.sleep(0.1)
@@ -87,40 +172,60 @@ def main(_argv):
                 continue
             else: 
                 break
+        # change frame_index condition HERE!!!
+        if frame_index%1 ==0:  
+          img_in = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) 
+          img_in = tf.expand_dims(img_in, 0)
+          img_in = transform_images(img_in, FLAGS.size)
 
-        img_in = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) 
-        img_in = tf.expand_dims(img_in, 0)
-        img_in = transform_images(img_in, FLAGS.size)
-
-        t1 = time.time()
-        boxes, scores, classes, nums = yolo.predict(img_in)
-        classes = classes[0]
-        names = []
-        for i in range(len(classes)):
-            names.append(class_names[int(classes[i])])
-        names = np.array(names)
-        converted_boxes = convert_boxes(img, boxes[0])
-        features = encoder(img, converted_boxes)    
-        detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in zip(converted_boxes, scores[0], names, features)]
-        
+          
+          boxes, scores, classes, nums = yolo.predict(img_in)
+          classes = classes[0]
+          names = []
+          for i in range(len(classes)):
+              names.append(class_names[int(classes[i])])
+          names = np.array(names)
+          converted_boxes = convert_boxes(img, boxes[0])
+          features = encoder(img, converted_boxes)
+          detections = [Detection(bbox, score, class_name, feature) for bbox, score, class_name, feature in zip(converted_boxes, scores[0], names, features)]
+          
+          # run non-maxima suppresion
+          boxs = np.array([d.tlwh for d in detections])
+          scores = np.array([d.confidence for d in detections])
+          classes = np.array([d.class_name for d in detections])
+          indices = preprocessing.non_max_suppression(boxs, classes, nms_max_overlap, scores)
+          
+          # detect condition:
+          #take_index = []
+          #for i in indices:
+          #  xyah = detections[i].to_xyah()
+          #  x,y = xyah[0],xyah[1]
+          #  if xyah[1] < count_line[0][1]:
+          #    if detection_rule.check((x,y)) == True:
+          #      take_index.append(i)
+          #detections = [detections[i] for i in take_index if ]   
+             
+          detections = [detections[i] for i in indices]
+          detections = [d for d in detections if d.to_xyah()[1] < count_line[0][1]]
+          detections = [d for d in detections if detection_rule.check( d.to_xyah()[0:2] )]
+          
+                  
+          
+        # Call the tracker
+        tracker.predict()
+        if frame_index%1 ==0:  
+          tracker.update(detections)
+          
         #initialize color map
         cmap = plt.get_cmap('tab20b')
         colors = [cmap(i)[:3] for i in np.linspace(0, 1, 20)]
-
-        # run non-maxima suppresion
-        boxs = np.array([d.tlwh for d in detections])
-        scores = np.array([d.confidence for d in detections])
-        classes = np.array([d.class_name for d in detections])
-        indices = preprocessing.non_max_suppression(boxs, classes, nms_max_overlap, scores)
-        detections = [detections[i] for i in indices]        
-
-        # Call the tracker
-        tracker.predict()
-        tracker.update(detections)
-
+        
+        # loop over list of track in trackers
         for track in tracker.tracks:
-            if not track.is_confirmed() or track.time_since_update > 1:
-                continue 
+            tlwh = track.to_tlbr()
+            x_mid = int((tlwh[0] + tlwh[2])/2)
+            y_mid = int((tlwh[1] + tlwh[3])/2)
+
             bbox = track.to_tlbr()
             class_name = track.get_class()
             color = colors[int(track.track_id) % len(colors)]
@@ -129,34 +234,50 @@ def main(_argv):
             cv2.rectangle(img, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
             cv2.putText(img, class_name + "-" + str(track.track_id),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
             
-        ### UNCOMMENT BELOW IF YOU WANT CONSTANTLY CHANGING YOLO DETECTIONS TO BE SHOWN ON SCREEN
-        #for det in detections:
-        #    bbox = det.to_tlbr() 
-        #    cv2.rectangle(img,(int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])),(255,0,0), 2)
-        
+            # increment of car_count variable
+            if y_mid > count_line[0][1] and track.track_id not in track_ids:
+              cv2.rectangle(img, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0,0,255), 5)
+              track_ids.append(track.track_id) 
+              car_count +=1  
+            # modify stack.state
+              track.state = TrackState.Deleted
+        tracker.draw_track(img)    
         # print fps on screen 
         fps  = ( fps + (1./(time.time()-t1)) ) / 2
         cv2.putText(img, "FPS: {:.2f}".format(fps), (0, 30),
                           cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (0, 0, 255), 2)
-        cv2.imshow('output', img)
+        
+        # image with car counting display
+        full_img = display_counting(img,count_line,detection_rule)
+        
+        
+        # write .mp4 file and log file
         if FLAGS.output:
-            out.write(img)
-            frame_index = frame_index + 1
+            out.write(full_img)         
             list_file.write(str(frame_index)+' ')
             if len(converted_boxes) != 0:
                 for i in range(0,len(converted_boxes)):
                     list_file.write(str(converted_boxes[i][0]) + ' '+str(converted_boxes[i][1]) + ' '+str(converted_boxes[i][2]) + ' '+str(converted_boxes[i][3]) + ' ')
             list_file.write('\n')
-
-        # press q to quit
-        if cv2.waitKey(1) == ord('q'):
-            break
+        if frame_index == 0:
+            cv2.imwrite("rules/old_pic.jpg",img)
     vid.release()
     if FLAGS.ouput:
         out.release()
         list_file.close()
-    cv2.destroyAllWindows()
-
+    
+    # save config: detection_rule
+    detection_rule = {"xmin":detection_rule.tl[0],"ymin":detection_rule.tl[1],
+    "xmax":detection_rule.br[0],"ymax":detection_rule.br[1],"img_path":"rules/old_pic.jpg"}
+    with open('rules/detection_rule.json', 'w') as outfile:
+      json.dump(detection_rule, outfile)
+    
+    # save config: count_line:
+    count_line = {"xleft":count_line[0][0],"yleft":count_line[0][1],"xright":count_line[1][1],"yright":count_line[1][1]}
+    with open('rules/count_line.json', 'w') as outfile:
+      json.dump(count_line, outfile)
+    
+    
 
 if __name__ == '__main__':
     try:
