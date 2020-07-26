@@ -11,10 +11,7 @@ class Conf:
     def __getitem__(self,k):
             # return the value associate with the supplied key
             return self.__dict__.get(k, None)
-            
-test_config = Conf("/home/mmlab/git_workspace/yolov3_deepsort/metric_config/cosine_distance.config")
-test_config_2 = Conf("/home/mmlab/git_workspace/yolov3_deepsort/metric_config/euclidean_distance.config")
-test_config_3 = Conf("/home/mmlab/git_workspace/yolov3_deepsort/model_config/deep_sort.config")         
+                  
 if __name__ == '__main__':
 
   print(test_config["max_cosine_distance"])
